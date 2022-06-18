@@ -1,153 +1,170 @@
-# coding: utf-8
+# coding: utf-8  # by vicramgon
 from __future__ import division
 
-import models, data, main, process_text
+import models, data, main
+from process_text import clear_endbreak_line
+import re
 
 import sys
 import codecs
-import re
 
 import tensorflow as tf
 import numpy as np
+import re
 
+# PARÁMETROS DEL SCRIPT 
+
+# Tamaño máximo de la secuencia 
 MAX_SUBSEQUENCE_LEN = 200
 
+# Signos de puntuación de fin de frase o intermedios
+EOS_PUNCTS = [".PERIOD", "?QUESTIONMARK", "!EXCLAMATIONMARK"]
+INS_PUNCTS = [",COMMA", ";SEMICOLON", ":COLON"]
+
+# Función para pasar a un array columna
 def to_array(arr, dtype=np.int32):
     # minibatch of 1 sequence as column
     return np.array([arr], dtype=dtype).T
 
-def makeReadable(original, tkspredicted):
-    res = ""
-    capitalize = False
-    numId = 0
-    nums = re.findall('\d+', original)
-    last_is_punct = False
+# Función de restauración de la puntuación
+def restore(text, word_vocabulary, reverse_punctuation_vocabulary, model, withKnownCaps=True):
+    """
+    Corresponde a la función de puntuación y capitalización de un texto/línea
+    a partir del modelo predictor. 
 
-    for tk in tkspredicted:
-        if tk == process_text.NUM:
-            res += ' ' + nums.pop(0)
-            capitalize = False
-            last_is_punct = False
+    Parámetros
+    ----------
+    text : str
+        El texto para ser puntuado y capitalizado
 
-        elif tk in data.PUNCTUATION_VOCABULARY:
-            last_is_punct = True
-            capitalize = False
+    word_vocabulary : dict(str,int)
+        Correspondiente al vocabulario de términos utilizado en el modelo, esto es
+        el que relaciona cada término con el correspondiente id (entero, int) que
+        le corresponde.
 
-            if tk[-1] == 'M':
-              capitalize = True
+    reverse_punctuation_vocabulary : dict(int,str)
+        Correspondiente al vocabulario de puntuaciones utilizado en el modelo, pero 
+        en el sentido inverso, que relaciona cada id con el token de puntuación 
+        correspondiente.
 
-            if tk == '·M' or tk == data.SPACE:
-                res += ' '
-            elif tk != process_text.BREAK:
-                res += tk[0] + ' '
+    model : models.GRU
+        Modelo predictor 
 
+    Salida
+    ------
+    None
 
-        else:
-          res += ('' if last_is_punct else ' ') + (tk[0].upper() if capitalize else tk[0]) + tk[1:]
-          capitalize = False
-          last_is_punct = False
-  
-    return re.sub('\s+', ' ', res).strip()
-
-def restoreLine(text, word_vocabulary, reverse_punctuation_vocabulary, model):
-    res = []
+  """
+    # Inicializamos un contador que indica el término de la secuencia que se está 
+    # analizando
     i = 0
+
+    # Inicializamos una cadena que servirá como almacén de la frase restaurada
+    res = ""
+
+    # Mientras no se haya llegado al final del texto
     while True:
+        # Se toma la subsecuencia desde el último término leído (el siguiente)
+        # hasta el tamaño máximo de la secuencia.
         subsequence = text[i:i+MAX_SUBSEQUENCE_LEN]
 
+        # Si el tamaño de la subsecuencia es 0, fin, ya se ha terminado de procesar
+        # el texto
         if len(subsequence) == 0:
             break
 
-        converted_subsequence = [word_vocabulary.get(w, word_vocabulary[data.UNK]) for w in subsequence]
+        # Se vectoriza la subsecuencia correspondiente
+        converted_subsequence = [ word_vocabulary["<NUM>"] if re.fullmatch('\d+', w) else word_vocabulary.get(w, word_vocabulary[data.UNK]) for w in subsequence]
 
+        # y se obtienen las probabilidades para cada signo de puntuación y cada término de la secuencia
+        # otorgadas por el modelo predictor.
         y = predict(to_array(converted_subsequence), model)
 
-        res.append(subsequence[0])
+        # se añade el primer término de la subsecuencia (para la que no hay predicción) 
+        res += subsequence[0]
 
+        # se establece una marca del último símbolo de puntuación final que se ha generado
         last_eos_idx = 0
+
+        # Se obtienen los signos de puntuación asignados a cada uno de los términos de la 
+        # secuencia.
         punctuations = []
         for y_t in y:
-
+            # Para ello, se considera como signo de puntuación aquél que maximiza la probabilidad 
+            # en base a las probabilidades dadas por el predictor
             p_i = np.argmax(tf.reshape(y_t, [-1]))
             punctuation = reverse_punctuation_vocabulary[p_i]
 
             punctuations.append(punctuation)
 
-            if punctuation in data.EOS_TOKENS:
-                last_eos_idx = len(punctuations) # we intentionally want the index of next element
 
-        if subsequence[-1] == process_text.END:
-            step = len(subsequence) - 1
-            
-        elif last_eos_idx != 0:
+            # Se actualiza la marca correspondiente al último signo de puntuación final generado
+            # (en realidad el índice siguiente a dicho signo de puntuación)
+            if punctuation in data.EOS_TOKENS:
+                last_eos_idx = len(punctuations) 
+        
+
+
+        # Si se ha generado algún signo de puntuación final, se establece la marca
+        # step al último generado
+        if last_eos_idx != 0:
             step = last_eos_idx
+        # Y si no, al final de la subsecuencia
         else:
             step = len(subsequence) - 1
 
+        # Durante step pasos (hasta el último signo de puntuación o en su defecto hasta el final de la susecuencia)
         for j in range(step):
-            res += [punctuations[j]]
-            if j < step - 1:
-                res.append(subsequence[1+j])
+            # Si el símbolo de puntuación correspondiente es final
+            if (len(punctuations[j]) > 1 and punctuations[j][-1] == "M") or (withKnownCaps and punctuations[j] in EOS_PUNCTS):
+                # Entonces se añade el símbolo (no el token) y el término siguiente, iniciándolo en mayúscula.
+                head = ' ' + subsequence[1+j][0].upper() if j < step - 1 else ' '
+                tail = subsequence[1+j][1:].lower() if j < step - 1 and len(subsequence[1+j]) > 1 else ' '
+                res += (punctuations[j][0] if len(punctuations[j]) > 2 else ' ') + head + tail
 
-        if subsequence[-1] == process_text.END:
-            res.append(subsequence[-1])
-            break
-
-        i += step
-   
-    return res[1:-1] 
-
-def restore(output_file, text, word_vocabulary, reverse_punctuation_vocabulary, model):
-    i = 0
-    with open(output_file, 'w') as f_out:
-        while True:
-
-            subsequence = text[i:i+MAX_SUBSEQUENCE_LEN]
-
-            if len(subsequence) == 0:
-                break
-
-            converted_subsequence = [word_vocabulary.get(w, word_vocabulary[data.UNK]) for w in subsequence]
-
-            y = predict(to_array(converted_subsequence), model)
-
-            f_out.write(subsequence[0])
-
-            last_eos_idx = 0
-            punctuations = []
-            for y_t in y:
-
-                p_i = np.argmax(tf.reshape(y_t, [-1]))
-                punctuation = reverse_punctuation_vocabulary[p_i]
-
-                punctuations.append(punctuation)
-
-                if punctuation in data.EOS_TOKENS:
-                    last_eos_idx = len(punctuations) # we intentionally want the index of next element
-
-            if subsequence[-1] == process_text.END:
-                step = len(subsequence) - 1
-            elif last_eos_idx != 0:
-                step = last_eos_idx
+            # Si la palabra siguiente corresponde a un token "<UNK>" entonces se establece en mayúscula 
+            elif j < step - 1 and converted_subsequence[1+j] == word_vocabulary[data.UNK] and withKnownCaps:
+                # Entonces se añade el símbolo (no el token) y el término siguiente, iniciándolo en mayúscula.
+                head = ' ' if punctuations[j] == data.SPACE else punctuations[j][0]
+                tail = ' ' + subsequence[1+j][0].upper() + (subsequence[1+j][1:].lower() if len(subsequence[1+j]) > 1 else ' ')
+                res += head + tail 
             else:
-                step = len(subsequence) - 1
+                # En otro caso se añade el símbolo (no el token) y el término en minúscula
+                head = ' ' if punctuations[j] == data.SPACE else punctuations[j][0]
+                tail = ' ' + subsequence[j+1].lower() if j < step - 1 else ' '
+                res += head + tail
 
-            for j in range(step):
-                f_out.write(" " + punctuations[j] + " " if punctuations[j] != data.SPACE else " ")
-                if j < step - 1:
-                    f_out.write(subsequence[1+j])
+        # Si se ha llegado al final del texto, el bucle finaliza
+        if subsequence[-1] == data.END:
+            break
+        
+        # Si no se sigue procesando desde el elemento siguiente al último signo de puntuación final o, en su defecto,
+        # desde el siguiente elemento al último de la subsecuencia
+        i += step
 
-            if subsequence[-1] == process_text.END:
-                break
+    # Finalmente, se capitaliza la primera palabra de la frase
+    return res[0].upper() + (res[1:] if len(res) > 1 else ' ')
 
-            i += step
-
+# La función de predicción que corresponde al softmax de las salidas dadas por la red
 def predict(x, model):
     return tf.nn.softmax(net(x))
 
 if __name__ == "__main__":
-    continuous_text = True
+    """
+      SCRIPT
 
+      Corresponde al script de regeneración de la puntuación. Tomando un fichero de texto sin 
+      puntuaciones ni mayúsculas, y un modelo predictor (que da las probabilidades asociadas a
+      cada signo de puntuación para cada término del texto), genera un nuevo archivo con el 
+      texto puntuado y capitalizado.
+
+      Parámetros
+      ----------
+      1. Ruta al archivo de texto de test (sin signos de puntuación ni mayúsculas)
+      2. La ruta al modelo GRU (Model.pcl), que actuará como modelo predictor
+      3. La ruta del fichero que almacenará el texto puntuado.
+      4. Si se quieren quitar las mayúsculas conocidas de antemano (relativas a UNK y EOS)
+    """
     if len(sys.argv) > 1:
         model_file = sys.argv[1]
     else:
@@ -163,64 +180,55 @@ if __name__ == "__main__":
     else:
         sys.exit("Output file path argument missing")
 
-    if len(sys.argv) > 4 and sys.argv[4]=='--bylines':
-        continuous_text = False
-        print("Processing text line by line")
+    if len(sys.argv) > 4 and sys.argv[4] == "--notKnownCaps":
+        withKnownCaps = False
     else:
-        print("Assuming continuous text")
+        withKnownCaps = True
 
+    # Se carga el vocabulario y se inicializa una matriz con 1s (según el tamaño del vocabulario y el batch size)
     vocab_len = len(data.read_vocabulary(data.WORD_VOCAB_FILE))
     x_len = vocab_len if vocab_len < data.MAX_WORD_VOCABULARY_SIZE else data.MAX_WORD_VOCABULARY_SIZE + data.MIN_WORD_COUNT_IN_VOCAB
     x = np.ones((x_len, main.MINIBATCH_SIZE)).astype(int)
 
+    # Se carga el modelo
     print("Loading model parameters...")
     net, _ = models.load(model_file, x)
 
+    print("Building model...")
+
+    # Se construyen los vocabularios de puntuación y términos
     word_vocabulary = net.x_vocabulary
     punctuation_vocabulary = net.y_vocabulary
 
     reverse_word_vocabulary = {v:k for k,v in word_vocabulary.items()}
     reverse_punctuation_vocabulary = {v:k for k,v in punctuation_vocabulary.items()}
 
-    print('Restoring punctuation...')
+    print("Restoring punctuation...")
+    # Se leen las lineas del fichero
+    with codecs.open(input_file, 'r', 'utf-8') as f:
+        lines = f.readlines()
 
-    if continuous_text:
-        with open(input_file, 'r') as f:
-            input_text = f.read()
-            input_text = process_text.process_line(input_text.strip())
-      
-        if len(input_text) == 0:
-            sys.exit("Input file empty.")
+    # Si no tiene se aborta
+    if len(lines) == 0:
+        sys.exit("Input file empty.")
 
-        text = [w for w in input_text.split() if w not in punctuation_vocabulary and w not in data.PUNCTUATION_MAPPING] 
-
-        restore(output_file, text, word_vocabulary, reverse_punctuation_vocabulary, net)
-
-        print("Finished! Inspect %s for the result" % output_file)
-    
-    else:
-        li = 0
-        with open(input_file, 'r') as f:
-            line = f.readline()
-            while line:
-              input_line = process_text.process_line(line.strip())
-              input_line = [w for w in input_line.split() if w not in punctuation_vocabulary and w not in data.PUNCTUATION_MAPPING]
-              punct_line = restoreLine(input_line, word_vocabulary, reverse_punctuation_vocabulary, net)
-              #print('processed line %d' % li)
-
-              with open(output_file, ('a' if li else 'w')) as f_out:
-                  readable_punct_line = makeReadable(line, punct_line)
-                  #print(readable_punct_line)
-                  f_out.write(readable_punct_line + '\n')
-
-              line = f.readline()
-              li += 1
-
-            if li == 0:
-                sys.exit("Input file empty.")
-            
-            else:
-                print("Finished! Inspect %s for the result" % output_file)
-              
-
+    # En otro caso, se abre el fichero que almacenará las frases puntadas y capitalizadas
+    with open(output_file, 'w') as fout:
+      fout.write("")
+    with open(output_file, 'a') as fout:
+      li = 0
+      # Para cada linea
+      for l in lines:
+        if li % 1000 == 0:
+            print(f"line{li}")
+        # Se obtiene el texto
+        input_text = re.sub('\s+', ' ', l.strip())
+        # Se eliminan las puntuaciones y se añade el token del final
+        text = [w for w in input_text.split() if w not in punctuation_vocabulary and w not in data.PUNCTUATION_MAPPING] + ["<BREAK>", data.END]
+        # Se puntua y capitaliza el texto de la linea
+        punct_text = restore(text, word_vocabulary, reverse_punctuation_vocabulary, net, withKnownCaps=withKnownCaps)
+        # Se vuelca al archivo de salida
+        fout.write(clear_endbreak_line(punct_text)+'\n')
+        # Leemos la siguiente linea 
+        li += 1
 
